@@ -359,7 +359,12 @@ def tape_markouts(t: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def main():
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(prog="whiskas.report")
+    ap.add_argument("--session", help="live recording for the anatomy-of-a-window figure (default: newest)")
+    ap.add_argument("--window", type=int, default=None, help="window start to plot (default: most bot fills)")
+    args = ap.parse_args(argv)
     style()
     stats: dict = {}
     fills = pd.read_parquet(DATA / "fills.parquet")
@@ -371,6 +376,10 @@ def main():
     fig_pairs(stats)
     fig_markouts(stats)
     fig_vol(stats)
+    sessions = sorted((DATA / "live").glob("session_*.jsonl.gz"))
+    session = args.session or (str(sessions[-1]) if sessions else None)
+    if session:
+        stats["live_window"] = fig_live_window(session, args.window)
     (FIGURES.parent / "stats.json").write_text(json.dumps(stats, indent=1, default=str))
     print("figures written to", FIGURES)
 

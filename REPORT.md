@@ -116,6 +116,12 @@ Role labels come from pulling every fill twice (`/v2/trades?taker_only=false` an
 labelling reproduces the maker rebates the wallet actually received: 20% × the fee-equivalent of its
 maker fills = $32.8k vs $33.4k paid.
 
+The switch happened in two steps. Around **Oct 15** taker volume fell ~85% while the realised taker
+edge *rose* (1.5¢ → 1.7–2.3¢ per share, weekly) — the signature of a higher take threshold, not of a
+decaying edge (the weekly taker edge had been stable at 1.1–2.6¢ since June). From **Oct 27** the
+resting quotes were scaled up and now carry 70% of the notional, at a thin edge (≈0.1–1.0¢/share
+weekly) plus rebates.
+
 ### 3.2 When in the window it trades
 
 ![timing](reports/figures/03_timing_in_window.png)
