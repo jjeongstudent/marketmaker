@@ -70,14 +70,15 @@ def taker_fee(p: Params, price: float, size: float) -> float:
 
 class Simulator:
     def __init__(self, session: Session, params: Params, feed: str = "chainlink", eval_ms: int = 250,
-                 take_cooldown_ms: int = 1000):
+                 take_cooldown_ms: int = 1000, seed_vol: bool = True):
         self.s = session
         self.take_cooldown_ms = take_cooldown_ms
         self.p = params
         self.feed = feed
         self.eval_ms = eval_ms
         self.fv = FairValue(twap_s=60, basis_noise_bps=0.5 if feed == "chainlink" else 1.0)
-        self._seed_vol()
+        if seed_vol:
+            self._seed_vol()
         self.windows: dict[int, WindowState] = {}
         self.tok2win: dict[str, tuple[int, str]] = {}
         for r in session.windows.itertuples():
@@ -124,15 +125,17 @@ class Simulator:
 
     # ---------------------------------------------------------------------------------- events
     def events(self):
-        ev = [(ts, 0, "book", tok, kind, p) for ts, tok, kind, p in self.s.book_events if tok in self.tok2win]
+        """Book updates and pricing ticks merged lazily in time order (book first on ties)."""
+        import heapq
+        book = ((ts, 0, "book", tok, kind, p) for ts, tok, kind, p in self.s.book_events if tok in self.tok2win)
         px = self.s.chainlink if self.feed == "chainlink" else self.s.binance
+        ticks = []
         if px is not None and not px.empty:
             ts_col = px["ts_ms"].to_numpy()
             # Chainlink RTDS stamps are the observation second; they arrive ~1 s later (rt)
             arrive = px["rt"].to_numpy() if "rt" in px else ts_col
-            ev += [(int(a), 1, "px", None, int(t), float(v)) for a, t, v in zip(arrive, ts_col, px["px"].to_numpy())]
-        ev.sort(key=lambda e: (e[0], e[1]))
-        return ev
+            ticks = sorted((int(a), 1, "px", None, int(t), float(v)) for a, t, v in zip(arrive, ts_col, px["px"].to_numpy()))
+        return heapq.merge(book, ticks, key=lambda e: (e[0], e[1]))
 
     def _attribute(self, ws: int, ts: int, side: str, level: float, depleted: float, tol: int = 150,
                    slack: float = 0.02) -> float:
@@ -187,6 +190,30 @@ class Simulator:
             traded = self._attribute(st.ws, ts, side, price, old - new) if new < old else 0.0
             changes = [(side, price, old, new, traded)]
         self._maker_fills(st, ts, changes)
+        for c_side, c_price, _old, c_new, c_traded in changes:
+            if c_new <= 0 and c_traded > 0:
+                self._cleared(st, ts, c_side, c_price)
+
+    def _cleared(self, st: WindowState, ts: int, side: str, price: float, tol: int = 150):
+        """A print cleared the whole level and kept going: an order of ours at the front of that level
+        would have absorbed part of the print's unexplained remainder."""
+        r = st.resting.get(("Up", price)) if side == "bid" else st.resting.get(("Down", round(1 - price, 4)))
+        if r is None or r.size <= 1e-9 or r.queue_ahead > 1e-9:
+            return
+        direction = 1 if side == "ask" else -1
+        tss, left = self.trade_ts[st.ws], self.trade_left[st.ws]
+        i = bisect.bisect_left(tss, ts - tol)
+        while i < len(tss) and tss[i] <= ts + tol and r.size > 1e-9:
+            if self.trade_dir[st.ws][i] == direction and left[i] > 0:
+                q = min(left[i], r.size)
+                left[i] -= q
+                self._fill(st, ts, r.token, r.price, q, "maker")
+                r.size -= q
+            i += 1
+        if r.size <= 1e-9:
+            key = (r.token, r.price)
+            st.resting.pop(key, None)
+            st.strat.resting.pop(key, None)
 
     def _maker_fills(self, st: WindowState, ts: int, changes):
         """Queue model for our phantom resting orders: traded depletion at our level eats the queue ahead

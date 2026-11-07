@@ -205,6 +205,42 @@ def fig_vol(stats):
     stats["vol"] = w.groupby("rvq", observed=True)[["pnl", "pair_pnl", "cost"]].mean().round(2).to_dict()
 
 
+def fig_live_window(session_path, window_start: int | None = None, name: str = "08_live_window.png") -> int:
+    """Anatomy of one recorded window: Up best bid/ask, model fair value, and the bot's fills."""
+    from .live.analyze import Session, summarize
+    s = Session.load(session_path)
+    f = summarize(session_path)["fills"]
+    if window_start is None:
+        window_start = int(f.groupby("window_start").size().idxmax())
+    rows = [(ts, max(b) if b else np.nan, min(a) if a else np.nan) for ts, b, a in s.up_book_replay(window_start)]
+    bk = pd.DataFrame(rows, columns=["ts", "bid", "ask"])
+    bk = bk[(bk["ts"] >= window_start * 1000) & (bk["ts"] < (window_start + 300) * 1000)]
+    bk["t"] = bk["ts"] / 1000 - window_start
+    w = f[f["window_start"] == window_start].copy()
+    w["up_px"] = np.where(w["outcome"] == "Up", w["price"], 1 - w["price"])
+    fig, ax = plt.subplots(figsize=(8.6, 4.0))
+    ax.step(bk["t"], bk["bid"], where="post", color=INK2, lw=1.0, label="Up best bid / best ask")
+    ax.step(bk["t"], bk["ask"], where="post", color=INK2, lw=1.0)
+    ax.plot(w["tau"], w["fv_up"], color=AQUA, lw=0, marker="_", ms=10, mew=2, label="model P(Up) at each fill")
+    for role, mk in (("maker", "o"), ("taker", "D")):
+        for out, face in (("Up", True), ("Down", False)):
+            x = w[(w["role"] == role) & (w["outcome"] == out)]
+            if x.empty:
+                continue
+            ax.scatter(x["tau"], x["up_px"], s=10 + 2 * x["size"].clip(upper=60), marker=mk,
+                       facecolor=ROLE[role] if face else SURFACE, edgecolor=ROLE[role], linewidth=1.4,
+                       label=f"bot {role} BUY {out}" + ("" if out == "Up" else " (plotted at 1 - price)"), zorder=3)
+    ax.axvspan(240, 300, color=GRID, alpha=0.6, lw=0)
+    ax.set_xlim(0, 300)
+    ax.set_xlabel("seconds since the window opened")
+    ax.set_ylabel("Up price")
+    ts = pd.Timestamp(window_start, unit="s", tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+    ax.set_title(f"One live window ({ts}): the bot's fills against the Up book")
+    ax.legend(loc="best", fontsize=7)
+    save(fig, name)
+    return window_start
+
+
 def md_table(df: pd.DataFrame, floatfmt: str = "{:,.2f}") -> str:
     cols = [str(c) for c in df.columns]
     lines = ["| " + " | ".join([df.index.name or ""] + cols) + " |",

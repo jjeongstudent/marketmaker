@@ -25,7 +25,7 @@ Where the money comes from:
 
 | | USD |
 |---|---:|
-| Gross trading edge (redemptions − purchase cost) | **+643k** |
+| Gross trading PnL before fees (payouts − purchase cost) | **+643k** |
 | Taker fees paid (`fee = shares × 0.07 × p × (1−p)`) | **−472k** |
 | Taker rebates (Obsidian tier: 50% of taker fees back) | **+206k** |
 | Maker rebates (20% of fees, fee-curve weighted) + liquidity rewards | **+36k** |
@@ -96,13 +96,13 @@ never sell, never merge; at settlement every Up+Down pair redeems for $1
 
 | Parameter | Regime A (Jun 16 – Oct 26) | Regime B (Oct 27 – now) | Evidence |
 |---|---|---|---|
-| Active time in window | 0–300 s, flat profile | quotes 6–250 s, takes late (median 196 s) | fig. 3 |
+| Active time in window | 0–300 s, flat profile | maker fills from ~10 s, fading after 240 s; takes late (median 196 s) | fig. 3 |
 | P_MIN – P_MAX | 0.12 – 0.89 (0.87 in late June, 0.90 mid-Oct) | 0.07 – 0.94 | fig. 4 |
 | CLIP_TAKE (shares) | 30 (Jun) → 90/45 (Jul) → 50 (Sep) → 60 (Oct) | 30 | modal taker fill sizes |
 | CLIP_MAKE / LEVELS | 30–60 shares | 30 shares × ≥4 levels, 1¢ apart | live book, level deltas |
 | Maker share of notional | 25% | 71% | fig. 2 |
 | Window spend (median / p99) | $113 (Jun) → $719 / $3.7k (Sep) | $232 / $1.2k | per-window costs |
-| Up–Down imbalance (p5–p95) | ±360 shares (Sep) | ±300 shares | inventory replay |
+| Up–Down imbalance after a fill (p5 / p95) | −361 / +427 shares (Sep) | −269 / +334 shares | inventory replay |
 
 Sizes and caps change in steps, roughly monthly — they are configuration, scaled with the bankroll.
 
@@ -152,11 +152,29 @@ rows in its activity) — it holds to settlement and redeems (76,865 redemptions
 | Regime B maker | +0.38¢/share | 0 | +0.38¢ + rebate |
 | Regime B taker | +1.90¢/share | 1.49¢ | +0.41¢ before, +1.16¢ after rebate |
 
-Both roles show **positive, rising markouts** — the maker fills are not adversely selected. The
-sampled tapes explain why: the takers who hit its quotes are a long tail of 2,043 wallets (top five =
-17% of that flow, including omnibus/app wallets), i.e. mostly uninformed flow, while the offers it
-lifts come from 1,438 makers, many of them other bots (CrouchPredictions, hdueilqhsdn, …). The bot is
-a mid-sized participant: ~2.4% of taker volume and ~0.7% of maker volume in regime A windows.
+Both roles show **positive, rising markouts** — the maker fills are not adversely selected.
+
+The same holds **without any fair-value model**. In 300 sampled windows with full tapes, compare the
+price the bot paid with where *everyone else* traded the same token around it (VWAP of other wallets'
+prints, cents):
+
+| regime / role | 30–6 s before | 5–1 s before | **1–5 s after** | 6–30 s after |
+|---|---:|---:|---:|---:|
+| A / maker | +1.50 | +0.35 | **+1.16** | +1.26 |
+| A / taker | +0.90 | +0.04 | **+2.02** | +1.95 |
+| B / maker | −0.69 | +0.06 | +0.12 | −0.09 |
+| B / taker | −0.61 | −1.37 | **+2.85** | +2.38 |
+
+Its takes buy a token **~2¢ below where the market trades it a few seconds later** — the signature of
+a faster price signal than the quotes it lifts (regime A), and of late-window momentum in regime B
+(the token had already risen 1.4¢ in the previous five seconds and keeps going). Its resting bids are
+hit ~1¢ below the subsequent market in regime A; in regime B they earn the spread and rebate only.
+
+Who is on the other side: the takers who hit its quotes are a long tail of ~2,000 wallets (top five
+= 15–17% of that flow, including omnibus/app wallets) — mostly uninformed flow — while the offers it
+lifts come from 470–1,440 makers, many of them other bots (CrouchPredictions, hdueilqhsdn, …). The bot
+is a mid-sized participant: 2.4% of taker and 0.7% of maker volume in regime-A windows, 0.35% / 1.0%
+in regime B (each window trades ≈ $22–24k while live).
 
 ### 3.6 When it makes money
 
@@ -207,6 +225,7 @@ python -m whiskas.collect stats && python -m whiskas.collect activity
 python -m whiskas.collect trades --role all && python -m whiskas.collect trades --role taker
 python -m whiskas.collect markets && python -m whiskas.collect klines --start 1781049600
 python -m whiskas.collect tapes && python -m whiskas.collect strikes
+python -m whiskas.features                    # derived tables in data/
 python -m whiskas.report                      # figures + reports/tables.md
 python -m whiskas.live.record --minutes 75    # live session
 python -m whiskas.bot.sim data/live/session_*.jsonl.gz --preset B

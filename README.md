@@ -26,7 +26,9 @@ python -m whiskas.collect trades --role all
 python -m whiskas.collect trades --role taker
 python -m whiskas.collect markets
 python -m whiskas.collect klines --start 1781049600
-python -m whiskas.report
+python -m whiskas.collect tapes
+python -m whiskas.features   # fills/enriched/per-window tables in data/
+python -m whiskas.report     # figures + reports/tables.md
 ```
 
 Data lands in `data/` (git-ignored, ~1 GB with klines). Network access needed: `*.polymarket.com`

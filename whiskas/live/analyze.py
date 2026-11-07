@@ -31,10 +31,15 @@ def iter_lines(path):
             return
 
 
+LEVEL_DTYPE = np.dtype([("ts", "i8"), ("tok", "i4"), ("buy", "i1"), ("price", "f8"), ("size", "f8")])
+
+
 @dataclass
 class Session:
     windows: pd.DataFrame                    # window_start, slug, condition_id, token_up, token_down
-    book_events: list = field(default_factory=list)  # (server_ms, token, kind, payload)
+    tokens: list = field(default_factory=list)       # token ids; book arrays refer to them by index
+    levels: np.ndarray | None = None                 # price_change rows (LEVEL_DTYPE), time-ordered
+    snaps: list = field(default_factory=list)        # (ts, tok_idx, bids[n,2], asks[n,2]), time-ordered
     trades: pd.DataFrame | None = None       # WS last_trade_price
     fills: pd.DataFrame | None = None        # wallet fills (Data API)
     chainlink: pd.DataFrame | None = None    # RTDS chainlink btc/usd, 1 s
@@ -42,7 +47,17 @@ class Session:
 
     @classmethod
     def load(cls, path) -> "Session":
-        wins, books, trades, fills, cl, bn = {}, [], [], [], [], []
+        """Parse a recording compactly (~25 bytes per level update) so long sessions fit in memory."""
+        wins, trades, fills, cl, bn = {}, [], [], [], []
+        tok_idx: dict = {}
+        lv_ts, lv_tok, lv_buy, lv_px, lv_sz = [], [], [], [], []
+        snaps = []
+
+        def idx(t):
+            if t not in tok_idx:
+                tok_idx[t] = len(tok_idx)
+            return tok_idx[t]
+
         for d in iter_lines(path):
             src, msg, rt = d["src"], d["msg"], d["rt"]
             if src == "meta" and "tokens" in msg:
@@ -54,10 +69,12 @@ class Session:
                     et = m.get("event_type") or ("price_change" if "price_changes" in m else None)
                     ts = int(m.get("timestamp") or 0)
                     if et == "book":
-                        books.append((ts, m["asset_id"], "book", m))
+                        arr = lambda xs: np.array([(float(x["price"]), float(x["size"])) for x in xs], dtype="f8").reshape(-1, 2)
+                        snaps.append((ts, idx(m["asset_id"]), arr(m["bids"]), arr(m["asks"])))
                     elif et == "price_change":
                         for pc in m["price_changes"]:
-                            books.append((ts, pc["asset_id"], "level", pc))
+                            lv_ts.append(ts); lv_tok.append(idx(pc["asset_id"])); lv_buy.append(pc["side"] == "BUY")
+                            lv_px.append(float(pc["price"])); lv_sz.append(float(pc["size"]))
                     elif et == "last_trade_price":
                         trades.append({"ts_ms": ts, "rt": rt, "token": m["asset_id"], "price": float(m["price"]),
                                        "size": float(m["size"]), "side": m["side"],
@@ -73,13 +90,35 @@ class Session:
             elif src == "bin" and "bidPrice" in msg:
                 bn.append({"ts_ms": rt, "rt": rt, "px": (float(msg["bidPrice"]) + float(msg["askPrice"])) / 2,
                            "src": "rest"})
-        books.sort(key=lambda x: x[0])
-        s = cls(pd.DataFrame(wins.values()), books)
+        lv = np.empty(len(lv_ts), dtype=LEVEL_DTYPE)
+        lv["ts"], lv["tok"], lv["buy"], lv["price"], lv["size"] = lv_ts, lv_tok, lv_buy, lv_px, lv_sz
+        lv = lv[np.argsort(lv["ts"], kind="stable")]
+        snaps.sort(key=lambda x: x[0])
+        s = cls(pd.DataFrame(wins.values()), list(tok_idx), lv, snaps)
         s.trades = pd.DataFrame(trades)
         s.fills = pd.DataFrame(fills).drop_duplicates(["transaction_hash", "token_id", "size", "price"]) if fills else pd.DataFrame()
         s.chainlink = pd.DataFrame(cl).drop_duplicates("ts_ms").sort_values("ts_ms") if cl else pd.DataFrame()
         s.binance = pd.DataFrame(bn).sort_values("ts_ms") if bn else pd.DataFrame()
         return s
+
+    @property
+    def book_events(self):
+        """Time-ordered (server_ms, token, kind, payload) with kind "book" (payload: bids/asks lists of
+        {price, size}) or "level" (payload: {price, size, side}), rebuilt lazily from compact arrays."""
+        lv, snaps, toks = self.levels, self.snaps, self.tokens
+        i = j = 0
+        n, m = len(lv), len(snaps)
+        while i < n or j < m:
+            if j < m and (i >= n or snaps[j][0] <= lv["ts"][i]):
+                ts, t, b, a = snaps[j]
+                yield ts, toks[t], "book", {"bids": [{"price": p, "size": z} for p, z in b],
+                                            "asks": [{"price": p, "size": z} for p, z in a]}
+                j += 1
+            else:
+                r = lv[i]
+                yield int(r["ts"]), toks[r["tok"]], "level", {"price": float(r["price"]), "size": float(r["size"]),
+                                                             "side": "BUY" if r["buy"] else "SELL"}
+                i += 1
 
     # --------------------------------------------------------------------------------------
     def token_map(self) -> dict:
