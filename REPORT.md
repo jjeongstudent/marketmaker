@@ -74,6 +74,7 @@ diagonal (0.15→0.14, 0.75→0.78, 0.97→0.96).
 ```
 every live window (t = seconds since open, 0..300), on every BTC tick / book update:
     fv_up   = P(TWAP60(end) >= TWAP60(start) | BTC now)        # TWAP-aware digital, sec. 1
+    fv_up   = w·fv_up + (1 − w)·book_mid                        # market-anchored (w ≈ 0.2 fits regime B)
     skew    = k · (shares_Up − shares_Down)                     # soft inventory balancing (modelled:
                                                                 #  54% of taker notional completes a pair,
                                                                 #  median final imbalance 12% of shares)
@@ -99,7 +100,7 @@ never sell, never merge; at settlement every Up+Down pair redeems for $1
 | Active time in window | 0–300 s, flat profile | maker fills from ~10 s, fading after 240 s; takes late (median 196 s) | fig. 3 |
 | P_MIN – P_MAX | 0.12 – 0.89 (0.87 in late June, 0.90 mid-Oct) | 0.07 – 0.94 | fig. 4 |
 | CLIP_TAKE (shares) | 30 (Jun) → 90/45 (Jul) → 50 (Sep) → 60 (Oct) | 30 | modal taker fill sizes |
-| CLIP_MAKE / LEVELS | 30–60 shares | 30 shares × ≥4 levels, 1¢ apart | live book, level deltas |
+| CLIP_MAKE / LEVELS | 30–60 shares | 30 shares at the touch; a short ladder (3 levels, 1¢ apart) seen once | live book, level deltas |
 | Maker share of notional | 25% | 71% | fig. 2 |
 | Window spend (median / p99) | $113 (Jun) → $719 / $3.7k (Sep) | $232 / $1.2k | per-window costs |
 | Up–Down imbalance after a fill (p5 / p95) | −361 / +427 shares (Sep) | −269 / +334 shares | inventory replay |
@@ -198,7 +199,29 @@ percentile range of −$261 to +$301; the worst single window lost $1,026.
 
 ## 4. Live observation (2026-11-07)
 
-LIVE_SECTION
+A 75-minute recording (02:17–03:32 UTC, 17 windows) of the CLOB market websocket for the current and
+next window (2.7M book-level updates, 32.6k snapshots, 16.3k prints), Chainlink BTC/USD from RTDS every
+second, and the wallet's fills polled every 5 s. Each fill is pinned to the websocket print with the same
+transaction hash (232 matched), which gives its exact match time and the book just before it
+(`python -m whiskas.live.analyze`).
+
+* **It joins the touch.** 81% of its 215 maker fills were exactly at the token's best bid just before
+  the match; the rest are sweeps that reached deeper resting orders, or book updates racing the print.
+* **30-share clips, refreshed every few seconds.** 95% of maker fills were preceded by that exact price
+  level growing by exactly 30 shares; the median time from that placement to the fill was 5.1 s
+  (10–90%: 0.3–19 s). Most maker fills are partial pieces of 30-share orders.
+* **Occasional short ladders.** One sweep filled three 30-share Down bids at 0.48 / 0.47 / 0.46 that had
+  been placed within 140 ms of each other ~6 s into the window.
+* **Mint matches.** Its resting BUY Down orders are filled by takers *buying Up* (the engine mints a new
+  pair, 0.51 + 0.49 = 1.00), which is why many fill prices sit a hair off the tick (0.4900001785).
+* **Takes** (17): clips of 30 shares (8), 50 (2) or the depth available, at the best offer. In one window
+  it bought Down at 0.61 → 0.70 → 0.86 during the final minute while the TWAP sat $0.5–1.5 below the
+  strike; BTC jumped ~$7 at τ≈280 s and Up won — the late-window momentum leg cuts both ways.
+* **Session result** (all fills in the 17 recorded windows): maker +$69 (+2.8¢/share on 2,444 shares),
+  takes −$80 — about break-even
+  before maker rebates, consistent with the thin regime-B edge.
+
+![live window](reports/figures/08_live_window.png)
 
 ## 5. Reference implementation
 
@@ -212,7 +235,24 @@ LIVE_SECTION
   latency, book walking for takes and a queue model for resting orders, then compares simulated fills
   with the wallet's real fills in the same windows.
 
-SIM_SECTION
+Calibrating the simulator on that recording (54-point grid; the score compares maker and taker
+share volumes and realised edges with the wallet's own fills in the 14 windows recorded from a minute
+before their open to their close) gives
+the regime-B preset: decision value = 0.2 × model + 0.8 × book mid, one 30-share BUY per token at
+min(best bid, value − 3¢), takes when `ask + fee/2 + 6¢ ≤ value` in 30-share clips.
+
+| 14 windows recorded in full (02:20–03:30 UTC) | maker shares | maker edge (won − price) | taker shares | taker edge |
+|---|---:|---:|---:|---:|
+| the wallet | 2,229 | +6.4¢ | 491 | −11.4¢ |
+| simulated preset B | 3,667 | +4.8¢ | 362 | −10.9¢ |
+
+The fit says the live bot is **strongly market-anchored**: its decision value is mostly the book mid
+with the model as a tilt — a purely model-driven variant (w = 1) takes 19× the wallet's taker volume
+(9.4k vs 0.5k shares).
+It is a coarse reproduction: the simulated quote usually sits a cent or two under the touch, where the
+real bot joins the touch part of the time (fills match in volume, not in placement), and 14 windows is a
+small sample. Run it with `python -m whiskas.bot.sim data/live/session_*.jsonl.gz --preset B`, or
+`whiskas.bot.sim.calibrate(...)` to refit on a new recording.
 
 It has **no order-sending code**: wiring it to the CLOB needs your own API credentials and the official
 client (`polymarket-client`), and polymarket.com is not available to US persons.

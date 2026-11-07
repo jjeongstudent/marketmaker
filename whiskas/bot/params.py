@@ -1,12 +1,12 @@
-"""Strategy parameters. Presets are fitted to the two regimes observed in the wallet's history.
+"""Strategy parameters, with presets for the two regimes observed in the wallet's history.
 
-Regime A ("taker-heavy", 2026-06-16 .. 2026-10-26): ~73% of notional taken, price band [0.12, 0.89],
-fixed clips of 30-60 shares (50 in September, 60 in October).
-Regime B ("maker-heavy", 2026-10-27 ..): ~70% of notional made, band [0.07, 0.94], clips 30/60.
+Regime A ("taker-heavy", 2026-06-16 .. 2026-10-26): ~75% of notional taken, price band [0.12, 0.89],
+fixed clips of 30-60 shares (50 in September, 60 in October). Band and clip sizes come from the fill
+history; the edges are illustrative defaults (no live book data exists for this regime).
+Regime B ("maker-heavy", 2026-10-27 ..): ~70% of notional made, band [0.07, 0.94], 30-share clips.
+Calibrated against a 75-minute live recording (see REGIME_B below and REPORT.md section 5).
 
-Edges are in price units (0.01 = 1 cent) and are measured against the strategy's own fair value.
-They were chosen so that the simulated fills reproduce the real bot's realised edge per share
-(maker ~ +1.2c, taker ~ +1.6c gross before fees in regime A); see REPORT.md.
+Edges are in price units (0.01 = 1 cent) and are measured against the strategy's decision value.
 """
 
 from __future__ import annotations
@@ -49,10 +49,13 @@ class Params:
 
 
 REGIME_A = Params()
-# Live observation (2026-11-07): 30-share BUYs joining the touch on both tokens with further 30-share
-# levels one cent apart below, first placed ~6 s into the window and refreshed every few seconds.
-REGIME_B = Params(p_min=0.07, p_max=0.94, quote_start_s=6.0, maker_edge=0.01, maker_size=30.0, ladder_levels=4,
-                  taker_edge=0.02, taker_size=30.0, quote_stop_s=250.0, max_imbalance=450.0,
-                  max_window_cost=2200.0)
+# Live observation (2026-11-07, 17 windows): 30-share BUYs joining the touch on both tokens (81% of
+# maker fills at the token's best bid, median order age 5 s) and 30-share taker clips. Calibrated with
+# whiskas.bot.sim.calibrate against the wallet's fills in the 14 fully recorded windows (54-point grid):
+# decision value = 80% book mid + 20% model; one level at min(best bid, value - 3c); takes need 6c of
+# edge after fees. Fit: maker shares 3,667 sim vs 2,229 real, taker 362 vs 491, realised edges within ~2c.
+REGIME_B = Params(p_min=0.07, p_max=0.94, quote_start_s=6.0, quote_stop_s=250.0, model_weight=0.2,
+                  maker_edge=0.03, maker_size=30.0, ladder_levels=1, taker_edge=0.06, taker_size=30.0,
+                  max_imbalance=450.0, max_window_cost=2200.0)
 
 PRESETS = {"A": REGIME_A, "B": REGIME_B}

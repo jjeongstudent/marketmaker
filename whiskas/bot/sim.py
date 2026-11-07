@@ -429,7 +429,9 @@ def calibrate(path: str, base: Params, grid: dict, workers: int = 4) -> pd.DataF
     windows = sorted(int(w) for w in s.windows["window_start"])
     winners = settle(s, windows)
     real = real_fills(s)
-    complete = [w for w in windows if w in winners and w * 1000 >= s.chainlink["ts_ms"].min() + 60_000]
+    # only windows recorded from 60 s before their open (strike) through their close, and resolved
+    first, last = s.chainlink["ts_ms"].min(), int(s.levels["ts"].max())
+    complete = [w for w in windows if w in winners and w * 1000 >= first + 60_000 and (w + WINDOW) * 1000 <= last]
     real = real[real["window_start"].isin(complete)]
     r = summarize(real, winners, "real").set_index("who", append=True)
     combos = [dict(zip(grid, v)) for v in itertools.product(*grid.values())]
