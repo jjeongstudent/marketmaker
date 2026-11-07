@@ -191,6 +191,11 @@ trending windows are its worst (a classic market-maker profile — the side it b
 value and the pair can only be completed at a higher cost). It runs 24/7: median 274 of 288 windows a
 day, busiest 13:00–15:00 UTC.
 
+Risk profile (all-in, including rebates): **$2,873/day on average over 144 active days, 6 losing
+days**, worst day −$1,625 (2026-09-14), which is also the maximum drawdown — a daily Sharpe of 1.3
+(≈25 annualised). Per window (after fees, before rebates) the median is +$1.52 with a 1st–99th
+percentile range of −$261 to +$301; the worst single window lost $1,026.
+
 ## 4. Live observation (2026-11-07)
 
 LIVE_SECTION
