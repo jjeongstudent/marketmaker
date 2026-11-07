@@ -5,14 +5,17 @@
 Execution model
   * The strategy is evaluated on every pricing tick and at most every `eval_ms` on book updates;
     its actions reach the book `latency_ms` later.
-  * Taker orders walk the recorded book (token view) up to their limit and size.
-  * A resting BUY joins the back of its level's queue (queue_ahead = recorded level size). Level
-    shrinkage that coincides (+-150 ms) with a taker print in the consuming direction eats the queue
-    ahead first and then our order; shrinkage without a print is treated as cancellations, removed
-    pro-rata from the queue ahead. If the touch moves through our price we are fully filled.
+  * Taker orders walk the recorded book (token view) up to their limit and size; liquidity we take is
+    remembered per level until the real book depletes it, and a token is taken at most once per
+    `take_cooldown_ms`.
+  * A resting BUY joins the back of its level's queue (queue_ahead = recorded level size). Each taker
+    print can explain at most its own size of level depletion at levels its (average) price reached;
+    that traded depletion eats the queue ahead and then our order. Depletion not explained by prints is
+    treated as cancellations and shrinks the queue ahead pro-rata. Fills therefore never exceed the
+    volume that actually traded at our price.
   * We never remove liquidity from the recorded book (the bot is ~1-3% of volume).
-Settlement uses the official open/close of each window (polymarket.com crypto-price), falling back
-to the TWAP-60 of the recorded Chainlink ticks.
+Settlement uses the on-chain resolution (Gamma outcomePrices), falling back to TWAP60(end) >=
+TWAP60(start) on the recorded Chainlink ticks.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import pandas as pd
 from ..live.analyze import Session
 from .model import FairValue
 from .params import PRESETS, Params
-from .strategy import TOKENS, Book, Inventory, Strategy
+from .strategy import Book, Inventory, Strategy
 
 WINDOW = 300
 
@@ -86,6 +89,8 @@ class Simulator:
         tr = session.trades
         self.trade_ts = {w: [] for w in self.windows}
         self.trade_dir = {w: [] for w in self.windows}
+        self.trade_px = {w: [] for w in self.windows}  # trade price in Up-book terms (taker's average)
+        self.trade_left = {w: [] for w in self.windows}  # share size not yet matched to book depletion
         for t in tr.itertuples():
             if t.token in self.tok2win:
                 w, tok = self.tok2win[t.token]
@@ -93,6 +98,13 @@ class Simulator:
                 up_buy = (tok == "Up") == (t.side == "BUY")
                 self.trade_ts[w].append(t.ts_ms)
                 self.trade_dir[w].append(1 if up_buy else -1)
+                self.trade_px[w].append(t.price if tok == "Up" else round(1 - t.price, 4))
+                self.trade_left[w].append(float(t.size))
+        for w in self.windows:  # websocket order is not guaranteed; the bisect lookups need time order
+            order = np.argsort(self.trade_ts[w], kind="stable")
+            for name in ("trade_ts", "trade_dir", "trade_px", "trade_left"):
+                arr = getattr(self, name)[w]
+                getattr(self, name)[w] = [arr[i] for i in order]
 
     def _seed_vol(self, lookback_s: int = 1800):
         """Seed the volatility estimate from Binance 1 s klines before the session (no warm-up bias)."""
@@ -122,14 +134,24 @@ class Simulator:
         ev.sort(key=lambda e: (e[0], e[1]))
         return ev
 
-    def _trade_near(self, ws: int, ts: int, direction: int, tol: int = 150) -> bool:
-        tss = self.trade_ts[ws]
+    def _attribute(self, ws: int, ts: int, side: str, level: float, depleted: float, tol: int = 150,
+                   slack: float = 0.02) -> float:
+        """How much of a level's depletion is explained by taker prints (each print can explain at most its
+        own size). Prints consuming `side` within `tol` ms whose (average) price reached `level` qualify;
+        reported prices are the taker's average over a sweep, hence the `slack`."""
+        direction = 1 if side == "ask" else -1
+        tss, left = self.trade_ts[ws], self.trade_left[ws]
         i = bisect.bisect_left(tss, ts - tol)
-        while i < len(tss) and tss[i] <= ts + tol:
-            if self.trade_dir[ws][i] == direction:
-                return True
+        got = 0.0
+        while i < len(tss) and tss[i] <= ts + tol and got < depleted:
+            if self.trade_dir[ws][i] == direction and left[i] > 0:
+                px = self.trade_px[ws][i]
+                if (direction < 0 and px <= level + slack) or (direction > 0 and px >= level - slack):
+                    take = min(left[i], depleted - got)
+                    left[i] -= take
+                    got += take
             i += 1
-        return False
+        return got
 
     def _apply_book(self, st: WindowState, ts: int, tok: str, kind: str, p: dict):
         mirror = tok == st.down
@@ -144,6 +166,8 @@ class Simulator:
                       [("bid", k, v, 0.0) for k, v in book.bids.items() if k not in b] + \
                       [("ask", k, v, 0.0) for k, v in book.asks.items() if k not in a]
             book.bids, book.asks = b, a
+            changes = [(sd, k, o, n, self._attribute(st.ws, ts, sd, k, o - n) if n < o else 0.0)
+                       for sd, k, o, n in changes]
         else:
             price = round(float(p["price"]), 4)
             side = "bid" if p["side"] == "BUY" else "ask"
@@ -160,36 +184,28 @@ class Simulator:
                 levels.pop(price, None)
             else:
                 levels[price] = new
-            changes = [(side, price, old, new)]
+            traded = self._attribute(st.ws, ts, side, price, old - new) if new < old else 0.0
+            changes = [(side, price, old, new, traded)]
         self._maker_fills(st, ts, changes)
 
     def _maker_fills(self, st: WindowState, ts: int, changes):
+        """Queue model for our phantom resting orders: traded depletion at our level eats the queue ahead
+        of us and then us; untraded depletion (cancellations) shrinks the queue ahead pro-rata."""
         for key, r in list(st.resting.items()):
-            tok = r.token
             side, lvl = r.level
-            for c_side, c_price, old, new in changes:
+            for c_side, c_price, old, new, traded in changes:
                 if c_side != side or abs(c_price - lvl) > 1e-9 or new >= old:
                     continue
-                d = old - new
-                consuming = 1 if side == "ask" else -1
-                if self._trade_near(st.ws, ts, consuming):
-                    r.queue_ahead -= d
-                    if r.queue_ahead < 0 or new == 0:
-                        q = r.size if new == 0 else min(r.size, -r.queue_ahead)
-                        self._fill(st, ts, tok, r.price, q, "maker")
+                cancelled = (old - new) - traded
+                if cancelled > 0 and old > 0:
+                    r.queue_ahead = max(0.0, r.queue_ahead - cancelled * (r.queue_ahead / old))
+                if traded > 0:
+                    r.queue_ahead -= traded
+                    if r.queue_ahead < 0:
+                        q = min(r.size, -r.queue_ahead)
+                        self._fill(st, ts, r.token, r.price, q, "maker")
                         r.size -= q
-                        r.queue_ahead = max(r.queue_ahead, 0.0)
-                elif old > 0:
-                    r.queue_ahead = max(0.0, r.queue_ahead - d * (r.queue_ahead / old))
-            # touch moved through our price -> everything ahead and us traded
-            if r.size > 1e-9:
-                through = (side == "bid" and st.book.bids and max(st.book.bids) < lvl - 1e-9 and
-                           self._trade_near(st.ws, ts, -1)) or \
-                          (side == "ask" and st.book.asks and min(st.book.asks) > lvl + 1e-9 and
-                           self._trade_near(st.ws, ts, 1))
-                if through:
-                    self._fill(st, ts, tok, r.price, r.size, "maker")
-                    r.size = 0
+                        r.queue_ahead = 0.0
             if r.size <= 1e-9:
                 st.resting.pop(key, None)
                 st.strat.resting.pop(key, None)
@@ -347,3 +363,69 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
+
+# ------------------------------------------------------------------------------- calibration
+
+_SESSION_CACHE: dict = {}
+
+
+def _run_one(args):
+    path, params = args
+    if path not in _SESSION_CACHE:
+        _SESSION_CACHE[path] = Session.load(path)
+    s = _SESSION_CACHE[path]
+    fills = Simulator(s, params).run()
+    return fills
+
+
+def real_fills(s: Session) -> pd.DataFrame:
+    real = s.fills.copy()
+    tm = s.token_map()
+    real["window_start"] = [tm.get(t, (np.nan, None))[0] for t in real["token_id"]]
+    real["token"] = [tm.get(t, (None, None))[1] for t in real["token_id"]]
+    real = real.dropna(subset=["window_start"])
+    real["tau"] = real["timestamp"] - real["window_start"]
+    real["fee"] = np.where(real["role"] == "taker", real["size"] * 0.07 * real["price"] * (1 - real["price"]) * 0.5, 0.0)
+    return real
+
+
+def calibrate(path: str, base: Params, grid: dict, workers: int = 4) -> pd.DataFrame:
+    """Grid-search parameters so the simulated fills match the wallet's real fills in the session's windows.
+
+    Distance = |log(sim/real maker shares)| + |log(sim/real taker shares)| + |maker edge gap| + |taker edge gap|
+    (edges in cents per share, realised against the actual winners, scaled by 1/2c)."""
+    import itertools
+    from concurrent.futures import ProcessPoolExecutor
+
+    s = Session.load(path)
+    windows = sorted(int(w) for w in s.windows["window_start"])
+    winners = settle(s, windows)
+    real = real_fills(s)
+    complete = [w for w in windows if w in winners and w * 1000 >= s.chainlink["ts_ms"].min() + 60_000]
+    real = real[real["window_start"].isin(complete)]
+    r = summarize(real, winners, "real").set_index("who", append=True)
+    combos = [dict(zip(grid, v)) for v in itertools.product(*grid.values())]
+    with ProcessPoolExecutor(workers) as ex:
+        results = list(ex.map(_run_one, [(path, base.with_(**c)) for c in combos]))
+    rows = []
+    for c, fills in zip(combos, results):
+        fills = fills[fills["window_start"].isin(complete)] if len(fills) else fills
+        sm = summarize(fills, winners, "sim")
+        row = dict(c)
+        for role in ("maker", "taker"):
+            rs = r.loc[(role, "real")] if (role, "real") in r.index else None
+            ss = sm.loc[role] if role in sm.index else None
+            row[f"{role}_shares_sim"] = 0.0 if ss is None else ss["shares"]
+            row[f"{role}_shares_real"] = 0.0 if rs is None else rs["shares"]
+            row[f"{role}_edge_sim"] = np.nan if ss is None else ss["edge_c_per_share"]
+            row[f"{role}_edge_real"] = np.nan if rs is None else rs["edge_c_per_share"]
+        d = 0.0
+        for role in ("maker", "taker"):
+            a, b = row[f"{role}_shares_sim"] + 1, row[f"{role}_shares_real"] + 1
+            d += abs(np.log(a / b))
+            if not np.isnan(row[f"{role}_edge_sim"]) and not np.isnan(row[f"{role}_edge_real"]):
+                d += abs(row[f"{role}_edge_sim"] - row[f"{role}_edge_real"]) / 2
+        row["distance"] = d
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("distance")

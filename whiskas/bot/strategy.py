@@ -109,6 +109,9 @@ class Strategy:
         if fv_up is None or tau < 0 or tau > p.take_stop_s:
             return [Action("cancel", t, px) for t, px in list(self.resting)]
 
+        if p.model_weight < 1.0 and book.bids and book.asks:
+            mid = (max(book.bids) + min(book.asks)) / 2
+            fv_up = p.model_weight * fv_up + (1 - p.model_weight) * mid
         skew = max(-p.max_skew, min(p.max_skew, inv.imbalance * p.skew_per_share))
         fv = {"Up": fv_up - skew, "Down": 1.0 - fv_up + skew}
 

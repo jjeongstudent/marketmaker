@@ -215,3 +215,91 @@ def enrich(fills: pd.DataFrame, btc: BTC, markets: pd.DataFrame | None = None, l
     f["won"] = np.where(is_up, f["winner"] == "Up", f["winner"] == "Down")
     f["payoff_edge"] = f["won"].astype(float) - f["price"]
     return f
+
+
+# ----------------------------------------------------------------------------- derived tables
+
+SPLIT_TS = 1793059200  # 2026-10-27 00:00 UTC: switch from taker-heavy (A) to maker-heavy (B)
+
+
+def inventory_path(e: pd.DataFrame) -> pd.DataFrame:
+    """Per-window inventory before each fill and whether the fill opens, adds to, or completes a pair."""
+    e = e.sort_values(["slug", "timestamp"], kind="stable").reset_index(drop=True)
+    up = (e["outcome_index"] == 0).to_numpy()
+    cols = {"q_up": np.where(up, e["size"], 0.0), "q_dn": np.where(~up, e["size"], 0.0),
+            "c_up": np.where(up, e["notional"], 0.0), "c_dn": np.where(~up, e["notional"], 0.0)}
+    for name, arr in cols.items():
+        x = pd.Series(arr, index=e.index)
+        e[name + "_before"] = x.groupby(e["slug"], sort=False).cumsum() - x
+    e["q_this_before"] = np.where(up, e["q_up_before"], e["q_dn_before"])
+    e["q_other_before"] = np.where(up, e["q_dn_before"], e["q_up_before"])
+    e["avg_other"] = np.where(up, e["c_dn_before"] / e["q_dn_before"].replace(0, np.nan),
+                              e["c_up_before"] / e["q_up_before"].replace(0, np.nan))
+    e["imb_before"] = e["q_this_before"] - e["q_other_before"]
+    e["kind"] = np.select([(e["q_this_before"] + e["q_other_before"] == 0).to_numpy(), (e["imb_before"] < 0).to_numpy()],
+                          ["first", "completing"], default="adding")
+    e["implied_pair_cost"] = e["price"] + e["avg_other"]
+    return e
+
+
+def per_market(fills: pd.DataFrame, markets: pd.DataFrame) -> pd.DataFrame:
+    """One row per BTC window: shares/cost per side, fees, payout, PnL split into the riskless pair part
+    (min(Up, Down) * (1 - avg Up - avg Down)) and the unpaired residual."""
+    f = fills[fills["asset"] == "btc"].merge(markets[["slug", "winner", "crypto_config"]], on="slug")
+    f["up"] = f["outcome_index"] == 0
+    g = f.groupby(["slug", "up"]).agg(q=("size", "sum"), c=("notional", "sum"), fee=("fee", "sum")).unstack("up").fillna(0)
+    g.columns = [f"{a}_{'up' if b else 'dn'}" for a, b in g.columns]
+    g = g.join(markets.set_index("slug")[["winner", "crypto_config"]])
+    g["t"] = g.index.str.rsplit("-", n=1).str[1].astype(int)
+    g["dt"] = pd.to_datetime(g["t"], unit="s", utc=True)
+    g["era"] = np.where(g["t"] < SPLIT_TS, "A", "B")
+    g["payout"] = np.where(g["winner"] == "Up", g["q_up"], g["q_dn"])
+    g["cost"] = g["c_up"] + g["c_dn"]
+    g["fees"] = g["fee_up"] + g["fee_dn"]
+    g["pnl"] = g["payout"] - g["cost"] - g["fees"]
+    g["pair_q"] = np.minimum(g["q_up"], g["q_dn"])
+    g["pu"] = g["c_up"] / g["q_up"].replace(0, np.nan)
+    g["pd"] = g["c_dn"] / g["q_dn"].replace(0, np.nan)
+    g["pair_cost"] = g["pu"] + g["pd"]
+    g["pair_pnl"] = (g["pair_q"] * (1 - g["pair_cost"])).fillna(0)
+    g["res_q"] = (g["q_up"] - g["q_dn"]).abs()
+    g["res_side_up"] = g["q_up"] > g["q_dn"]
+    g["res_won"] = np.where(g["res_side_up"], g["winner"] == "Up", g["winner"] == "Down")
+    g["res_px"] = np.where(g["res_side_up"], g["pu"], g["pd"])
+    g["res_pnl"] = g["pnl"] + g["fees"] - g["pair_pnl"]  # gross directional part
+    g["net_ratio"] = g["res_q"] / (g["q_up"] + g["q_dn"])
+    return g
+
+
+def per_window_vol(pm: pd.DataFrame, btc: BTC) -> pd.DataFrame:
+    """Per-window realised BTC volatility / range / net move next to the bot's per-window PnL."""
+    w = pm.reset_index()[["slug", "t", "cost", "pnl", "pair_pnl", "res_pnl", "fees", "era"]].rename(columns={"t": "ws"})
+    lc = np.log(btc.close)
+    idx0 = (w["ws"] - btc.t0).to_numpy()
+    ok = (idx0 > 0) & (idx0 + 300 < len(lc))
+    w, idx0 = w[ok].copy(), idx0[ok]
+    seg = np.stack([lc[i:i + 301] for i in idx0])
+    w["rv_bps"] = np.sqrt((np.diff(seg, axis=1) ** 2).sum(axis=1)) * 1e4
+    w["move_bps"] = np.abs(seg[:, -1] - seg[:, 0]) * 1e4
+    w["rvq"] = pd.qcut(w["rv_bps"], 5, labels=["q1 calm", "q2", "q3", "q4", "q5 wild"])
+    w["mq"] = pd.qcut(w["move_bps"], 5, labels=["q1 flat", "q2", "q3", "q4", "q5 trend"])
+    return w
+
+
+def main():
+    """Build data/fills.parquet, enriched.parquet, per_market.parquet and per_window_vol.parquet."""
+    fills = load_fills()
+    fills.to_parquet(DATA / "fills.parquet", index=False)
+    markets = load_markets()
+    btc = BTC.load()
+    e = inventory_path(enrich(fills, btc, markets))
+    e["regime"] = np.where(e["timestamp"] < SPLIT_TS, "A", "B")
+    e.to_parquet(DATA / "enriched.parquet", index=False)
+    pm = per_market(fills, markets)
+    pm.to_parquet(DATA / "per_market.parquet")
+    per_window_vol(pm, btc).to_parquet(DATA / "per_window_vol.parquet")
+    print(f"fills {len(fills):,}  enriched {len(e):,}  windows {len(pm):,}")
+
+
+if __name__ == "__main__":
+    main()

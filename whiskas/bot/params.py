@@ -20,6 +20,8 @@ class Params:
     quote_start_s: float = 3.0      # no resting quotes in the opening seconds
     quote_stop_s: float = 270.0     # pull resting quotes after this
     take_stop_s: float = 292.0      # no new taker orders after this
+    # --- fair value used for decisions: w * model + (1 - w) * book mid (the bot quotes around the market)
+    model_weight: float = 1.0
     # --- price band for any purchase (token price)
     p_min: float = 0.12
     p_max: float = 0.89

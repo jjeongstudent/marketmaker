@@ -259,11 +259,75 @@ def tables(fills: pd.DataFrame) -> str:
     return "\n\n".join(out) + "\n"
 
 
+def tape_stats() -> str:
+    """Market share and counterparties from the sampled full-market tapes (data/tapes)."""
+    from .config import WALLET
+    files = sorted((DATA / "tapes").glob("*.parquet"))
+    if not files:
+        return ""
+    t = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    t["ws"] = t["slug"].str.rsplit("-", n=1).str[1].astype(int)
+    t["tau"] = t["timestamp"] - t["ws"]
+    t["regime"] = np.where(t["ws"] < SPLIT.timestamp(), "A", "B")
+    t["notional"] = t["size"] * t["price"]
+    rows = {}
+    for reg, d in t.groupby("regime"):
+        live = d[(d["tau"] >= 0) & (d["tau"] < 300)]
+        tk, mk = live[live["role"] == "taker"], live[live["role"] == "maker"]
+        bot = live[live["proxy_wallet"] == WALLET]
+        bt = set(bot.loc[bot["role"] == "taker", "transaction_hash"])
+        bm = set(bot.loc[bot["role"] == "maker", "transaction_hash"])
+        others = live[live["proxy_wallet"] != WALLET]
+        makers_vs = others[others["transaction_hash"].isin(bt) & (others["role"] == "maker")].groupby("proxy_wallet")["notional"].sum()
+        takers_vs = others[others["transaction_hash"].isin(bm) & (others["role"] == "taker")].groupby("proxy_wallet")["notional"].sum()
+        rows[reg] = {
+            "windows": d["slug"].nunique(),
+            "live notional / window": f"${tk['notional'].sum() / d['slug'].nunique():,.0f}",
+            "pre-open share of volume": f"{d.loc[(d['role'] == 'taker') & (d['tau'] < 0), 'notional'].sum() / d.loc[d['role'] == 'taker', 'notional'].sum():.1%}",
+            "bot share of taker volume": f"{tk.loc[tk['proxy_wallet'] == WALLET, 'notional'].sum() / tk['notional'].sum():.2%}",
+            "bot share of maker volume": f"{mk.loc[mk['proxy_wallet'] == WALLET, 'notional'].sum() / mk['notional'].sum():.2%}",
+            "wallets hitting its quotes": f"{len(takers_vs):,}",
+            "top-5 share of that flow": f"{takers_vs.nlargest(5).sum() / takers_vs.sum():.0%}",
+            "wallets it lifts from": f"{len(makers_vs):,}",
+            "top-5 share of those makers": f"{makers_vs.nlargest(5).sum() / makers_vs.sum():.0%}",
+        }
+    df = pd.DataFrame(rows)
+    df.index.name = "sampled tapes"
+    return ("### Market share and counterparties (sampled full tapes)\n\n" + md_table(df) + "\n\n" +
+            "### Model-free markouts: other traders' token VWAP minus the bot's price (cents, mean)\n\n" +
+            md_table(tape_markouts(t)) + "\n")
+
+
+def tape_markouts(t: pd.DataFrame) -> pd.DataFrame:
+    """Where everyone else trades the same token before/after each bot fill (no fair-value model)."""
+    from .config import WALLET
+    prints = t[(t["role"] == "taker") & (t["proxy_wallet"] != WALLET)].copy()
+    prints["up_px"] = np.where(prints["outcome_index"] == 0, prints["price"], 1 - prints["price"])
+    spans = {"-30..-6 s": (-30, -6), "-5..-1 s": (-5, -1), "+1..+5 s": (1, 5), "+6..+30 s": (6, 30)}
+    acc: dict = {}
+    for slug, d in t[t["proxy_wallet"] == WALLET].groupby("slug"):
+        o = prints[prints["slug"] == slug].sort_values("timestamp")
+        if o.empty:
+            continue
+        ts, px, sz = o["timestamp"].to_numpy(), o["up_px"].to_numpy(), o["size"].to_numpy()
+        for r in d.itertuples():
+            for lab, (a, b) in spans.items():
+                m = (ts >= r.timestamp + a) & (ts <= r.timestamp + b)
+                if m.any():
+                    v = np.average(px[m], weights=sz[m])
+                    v = v if r.outcome_index == 0 else 1 - v
+                    acc.setdefault((r.regime, r.role, lab), []).append(100 * (v - r.price))
+    out = pd.Series({k: float(np.mean(v)) for k, v in acc.items()}).unstack()[list(spans)]
+    out.index = [f"{a} / {b}" for a, b in out.index]
+    out.index.name = "regime / role"
+    return out
+
+
 def main():
     style()
     stats: dict = {}
     fills = pd.read_parquet(DATA / "fills.parquet")
-    (FIGURES.parent / "tables.md").write_text(tables(fills))
+    (FIGURES.parent / "tables.md").write_text(tables(fills) + "\n" + tape_stats())
     fig_pnl_decomposition(stats)
     fig_flow(fills, stats)
     fig_timing(fills)

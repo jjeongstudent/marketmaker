@@ -179,17 +179,89 @@ def book_context(s: Session, fills: pd.DataFrame, depth: int = 5) -> pd.DataFram
     return fills.merge(ctx, on=["transaction_hash", "token_id", "size", "price"], how="left")
 
 
+def placements(s: Session, size: float = 30.0) -> dict:
+    """Times at which a book level grew by exactly `size` shares, keyed by (window, Up-book side, price)."""
+    tm = s.token_map()
+    adds: dict = defaultdict(list)
+    last: dict = {}
+    for ts, tok, kind, p in s.book_events:
+        if kind != "level" or tok not in tm:
+            continue
+        ws, out = tm[tok]
+        price = round(float(p["price"]), 4)
+        side = "bid" if p["side"] == "BUY" else "ask"
+        if out == "Down":
+            price, side = round(1 - price, 4), ("ask" if side == "bid" else "bid")
+        key = (ws, side, price)
+        new = float(p["size"])
+        if round(new - last.get(key, 0.0), 2) == size:
+            adds[key].append(ts)
+        last[key] = new
+    return adds
+
+
+def fair_values(s: Session, fills: pd.DataFrame, feed: str = "chainlink") -> np.ndarray:
+    """Model P(Up) at each fill's match time from the recorded feed (variance seeded from the session)."""
+    from ..bot.model import FairValue
+    px = s.chainlink if feed == "chainlink" else s.binance[s.binance["src"] == "rest"]
+    fv = FairValue(twap_s=60, basis_noise_bps=0.5)
+    sec = px.assign(sec=px["ts_ms"] // 1000).groupby("sec")["px"].last()
+    r5 = np.log(sec.reindex(range(sec.index.min(), sec.index.max() + 1)).ffill()).diff(5).dropna()
+    fv.seed_variance(float((r5 ** 2).mean() / 5))
+    ts, vals = px["ts_ms"].to_numpy(), px["px"].to_numpy()
+    out, j = [], 0
+    for r in fills.sort_values("ts_ms").itertuples():
+        while j < len(ts) and ts[j] <= r.ts_ms:
+            fv.on_price(int(ts[j]), float(vals[j]))
+            j += 1
+        out.append(fv.p_up(r.ts_ms / 1000, int(r.window_start)))
+    return pd.Series(out, index=fills.sort_values("ts_ms").index).reindex(fills.index).to_numpy()
+
+
+def summarize(path) -> dict:
+    """Key facts about the wallet's behaviour in a recorded session."""
+    s = Session.load(path)
+    f = book_context(s, match_fills(s))
+    f = f[f["ts_ms"].notna()].copy()
+    f["tau"] = f["tau_ms"] / 1000
+    f["tok_bid"] = np.where(f["outcome"] == "Up", f["best_bid"], 1 - f["best_ask"])
+    f["tok_ask"] = np.where(f["outcome"] == "Up", f["best_ask"], 1 - f["best_bid"])
+    f["fv_up"] = fair_values(s, f)
+    f["fv_tok"] = np.where(f["outcome"] == "Up", f["fv_up"], 1 - f["fv_up"])
+    adds = placements(s)
+    ages = []
+    for r in f.itertuples():
+        lst = adds.get((r.window_start, r.book_side, round(r.up_price, 4)), [])
+        i = np.searchsorted(lst, r.ts_ms, side="right") - 1
+        ages.append((r.ts_ms - lst[i]) / 1000 if i >= 0 else np.nan)
+    f["order_age_s"] = ages
+    mk, tk = f[f["role"] == "maker"], f[f["role"] == "taker"]
+    res = {
+        "windows": int(s.windows["window_start"].nunique()),
+        "fills_matched": int(len(f)), "maker_fills": int(len(mk)), "taker_fills": int(len(tk)),
+        "maker_at_token_best_bid": float(np.isclose(mk["price"].round(2), mk["tok_bid"]).mean()),
+        "maker_below_best_bid_c": (100 * (mk["tok_bid"] - mk["price"].round(2))).describe().round(2).to_dict(),
+        "maker_with_30_placement": float(mk["order_age_s"].notna().mean()),
+        "maker_order_age_s": mk["order_age_s"].quantile([.1, .25, .5, .75, .9]).round(2).to_dict(),
+        "maker_first_tau_s": float(mk.groupby("window_start")["tau"].min().median()),
+        "maker_tau_s": mk["tau"].quantile([.1, .5, .9]).round(1).to_dict(),
+        "maker_fv_minus_price_c": (100 * (mk["fv_tok"] - mk["price"])).quantile([.1, .5, .9]).round(2).to_dict(),
+        "taker_tau_s": tk["tau"].round(1).tolist(),
+        "taker_price_minus_best_offer_c": (100 * (tk["price"] - tk["tok_ask"])).round(2).tolist(),
+        "taker_fv_minus_price_c": (100 * (tk["fv_tok"] - tk["price"])).round(2).tolist(),
+        "maker_sizes": mk["size"].round(2).value_counts().head(8).to_dict(),
+        "taker_sizes": tk["size"].round(2).value_counts().head(8).to_dict(),
+    }
+    res["fills"] = f
+    return res
+
+
 def main(argv=None):
     path = (argv or sys.argv[1:])[0]
-    s = Session.load(path)
-    print(f"windows {len(s.windows)}  book events {len(s.book_events)}  trades {len(s.trades)}  "
-          f"fills {len(s.fills)}  chainlink {len(s.chainlink)}  binance {len(s.binance)}")
-    f = book_context(s, match_fills(s))
-    f["mid"] = (f["best_bid"] + f["best_ask"]) / 2
-    f["at_touch"] = np.where(f["book_side"] == "bid", np.isclose(f["up_price"], f["best_bid"]),
-                             np.isclose(f["up_price"], f["best_ask"]))
-    print(f.groupby("role").agg(n=("size", "size"), matched=("ts_ms", lambda x: x.notna().mean()),
-                                at_touch=("at_touch", "mean")).to_string())
+    res = summarize(path)
+    res.pop("fills")
+    for k, v in res.items():
+        print(f"{k}: {v}")
 
 
 if __name__ == "__main__":
